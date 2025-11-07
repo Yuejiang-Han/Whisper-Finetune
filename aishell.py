@@ -1,13 +1,13 @@
 import argparse
+import functools
 import json
 import os
-import functools
+from multiprocessing import Pool, cpu_count
 
 import soundfile
 from tqdm import tqdm
 
-from utils.utils import download, unpack
-from utils.utils import add_arguments, print_arguments
+from utils.utils import add_arguments, download, print_arguments, unpack
 
 DATA_URL = 'https://openslr.elda.org/resources/33/data_aishell.tgz'
 MD5_DATA = '2f494334227864a8a8fec932999db9d8'
@@ -18,13 +18,50 @@ add_arg("filepath", default=None, type=str, help="压缩包data_aishell.tgz文�
 add_arg("target_dir", default="dataset/audio/", type=str, help="存放音频文件的目录")
 add_arg("annotation_text", default="dataset/", type=str, help="存放音频标注文件的目录")
 add_arg('add_pun', default=False, type=bool, help="是否添加标点符")
+add_arg('num_workers', default=None, type=int, help="并行处理的进程数，默认使用CPU核心数")
 args = parser.parse_args()
 
 
-def create_annotation_text(data_dir, annotation_path):
+def process_audio_duration(line_data):
+    """处理单个音频文件，获取时长信息"""
+    try:
+        audio_path = line_data['audio']['path']
+        sample, sr = soundfile.read(audio_path)
+        duration = round(sample.shape[-1] / float(sr), 2)
+        line_data["duration"] = duration
+        line_data["sentences"] = [{"start": 0, "end": duration, "text": line_data["sentence"]}]
+        return line_data
+    except Exception as e:
+        print(f"Error processing {line_data['audio']['path']}: {e}")
+        return None
+
+
+def add_duration_parallel(lines, num_workers=None):
+    """并行添加音频时长信息"""
+    if num_workers is None:
+        num_workers = cpu_count()
+    
+    print(f"使用 {num_workers} 个进程并行处理音频时长...")
+    
+    with Pool(processes=num_workers) as pool:
+        # 使用imap_unordered可以更快地获取结果，但顺序会打乱
+        results = list(tqdm(
+            pool.imap(process_audio_duration, lines),
+            total=len(lines),
+            desc="处理音频"
+        ))
+    
+    # 过滤掉处理失败的结果
+    results = [r for r in results if r is not None]
+    return results
+
+
+def create_annotation_text(data_dir, annotation_path, num_workers=None):
     print('Create Aishell annotation text ...')
+    inference_pipline = None
     if args.add_pun:
         import logging
+
         from modelscope.pipelines import pipeline
         from modelscope.utils.constant import Tasks
         from modelscope.utils.logger import get_logger
@@ -33,24 +70,33 @@ def create_annotation_text(data_dir, annotation_path):
         inference_pipline = pipeline(task=Tasks.punctuation,
                                      model='iic/punc_ct-transformer_cn-en-common-vocab471067-large',
                                      model_revision="v2.0.4")
+    
     if not os.path.exists(annotation_path):
         os.makedirs(annotation_path)
+    
     f_train = open(os.path.join(annotation_path, 'train.json'), 'w', encoding='utf-8')
     f_test = open(os.path.join(annotation_path, 'test.json'), 'w', encoding='utf-8')
+    
     transcript_path = os.path.join(data_dir, 'transcript', 'aishell_transcript_v0.8.txt')
     transcript_dict = {}
+    
+    print("读取转录文本...")
     with open(transcript_path, 'r', encoding='utf-8') as f:
         lines = f.readlines()
-    for line in tqdm(lines):
+    
+    for line in tqdm(lines, desc="处理转录文本"):
         line = line.strip()
-        if line == '': continue
+        if line == '': 
+            continue
         audio_id, text = line.split(' ', 1)
         # remove space
         text = ''.join(text.split())
         if args.add_pun:
             text = inference_pipline(text_in=text)['text']
         transcript_dict[audio_id] = text
+    
     # 训练集
+    print("准备训练集数据...")
     data_types = ['train', 'dev']
     lines = []
     for type in data_types:
@@ -65,16 +111,15 @@ def create_annotation_text(data_dir, annotation_path):
                 text = transcript_dict[audio_id]
                 line = {"audio": {"path": audio_path}, "sentence": text}
                 lines.append(line)
-    # 添加音频时长
-    for i in tqdm(range(len(lines))):
-        audio_path = lines[i]['audio']['path']
-        sample, sr = soundfile.read(audio_path)
-        duration = round(sample.shape[-1] / float(sr), 2)
-        lines[i]["duration"] = duration
-        lines[i]["sentences"] = [{"start": 0, "end": duration, "text": lines[i]["sentence"]}]
+    
+    # 并行添加音频时长
+    lines = add_duration_parallel(lines, num_workers)
+    
     for line in lines:
         f_train.write(json.dumps(line, ensure_ascii=False) + "\n")
+    
     # 测试集
+    print("准备测试集数据...")
     audio_dir = os.path.join(data_dir, 'wav', 'test')
     lines = []
     for subfolder, _, filelist in sorted(os.walk(audio_dir)):
@@ -87,20 +132,19 @@ def create_annotation_text(data_dir, annotation_path):
             text = transcript_dict[audio_id]
             line = {"audio": {"path": audio_path}, "sentence": text}
             lines.append(line)
-    # 添加音频时长
-    for i in tqdm(range(len(lines))):
-        audio_path = lines[i]['audio']['path']
-        sample, sr = soundfile.read(audio_path)
-        duration = round(sample.shape[-1] / float(sr), 2)
-        lines[i]["duration"] = duration
-        lines[i]["sentences"] = [{"start": 0, "end": duration, "text": lines[i]["sentence"]}]
+    
+    # 并行添加音频时长
+    lines = add_duration_parallel(lines, num_workers)
+    
     for line in lines:
-        f_test.write(json.dumps(line,  ensure_ascii=False)+"\n")
+        f_test.write(json.dumps(line, ensure_ascii=False) + "\n")
+    
     f_test.close()
     f_train.close()
+    print("完成！")
 
 
-def prepare_dataset(url, md5sum, target_dir, annotation_path, filepath=None):
+def prepare_dataset(url, md5sum, target_dir, annotation_path, filepath=None, num_workers=None):
     """Download, unpack and create manifest file."""
     data_dir = os.path.join(target_dir, 'data_aishell')
     if not os.path.exists(data_dir):
@@ -115,19 +159,23 @@ def prepare_dataset(url, md5sum, target_dir, annotation_path, filepath=None):
         os.remove(filepath)
     else:
         print("Skip downloading and unpacking. Aishell data already exists in %s." % target_dir)
-    create_annotation_text(data_dir, annotation_path)
+    create_annotation_text(data_dir, annotation_path, num_workers)
 
 
 def main():
     print_arguments(args)
     if args.target_dir.startswith('~'):
         args.target_dir = os.path.expanduser(args.target_dir)
+    
+    num_workers = args.num_workers if args.num_workers else cpu_count()
+    print(f"将使用 {num_workers} 个CPU核心进行并行处理")
 
     prepare_dataset(url=DATA_URL,
                     md5sum=MD5_DATA,
                     target_dir=args.target_dir,
                     annotation_path=args.annotation_text,
-                    filepath=args.filepath)
+                    filepath=args.filepath,
+                    num_workers=num_workers)
 
 
 if __name__ == '__main__':

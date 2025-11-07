@@ -3,9 +3,11 @@ import functools
 import platform
 
 import torch
-from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline, AutoModelForCausalLM
+from transformers import (
+    AutoModelForCausalLM, AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+)
 
-from utils.utils import print_arguments, add_arguments
+from utils.utils import add_arguments, print_arguments
 
 parser = argparse.ArgumentParser(description=__doc__)
 add_arg = functools.partial(add_arguments, argparser=parser)
@@ -32,10 +34,27 @@ torch_dtype = torch.float16 if torch.cuda.is_available() and args.use_gpu else t
 processor = AutoProcessor.from_pretrained(args.model_path)
 
 # 获取模型
-model = AutoModelForSpeechSeq2Seq.from_pretrained(
-    args.model_path, torch_dtype=torch_dtype, low_cpu_mem_usage=True, use_safetensors=True,
-    use_flash_attention_2=args.use_flash_attention_2
-)
+# model = AutoModelForSpeechSeq2Seq.from_pretrained(
+#     args.model_path, torch_dtype=torch_dtype, low_cpu_mem_usage=True, use_safetensors=True,
+#     use_flash_attention_2=args.use_flash_attention_2
+# )
+
+# 准备模型加载参数
+model_kwargs = {
+    "low_cpu_mem_usage": True,
+    "use_safetensors": True
+}
+
+# 使用新的参数名 dtype 而不是 torch_dtype
+if torch.cuda.is_available() and args.use_gpu:
+    model_kwargs["torch_dtype"] = torch_dtype
+
+# 只在启用时才传递 use_flash_attention_2
+if args.use_flash_attention_2:
+    model_kwargs["use_flash_attention_2"] = True
+
+model = AutoModelForSpeechSeq2Seq.from_pretrained(args.model_path, **model_kwargs)
+
 model.generation_config.forced_decoder_ids = None
 if args.use_bettertransformer and not args.use_flash_attention_2:
     model = model.to_bettertransformer()
